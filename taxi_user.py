@@ -70,7 +70,7 @@ def send_ride_request(user_id, current_location, destination):
 def main():
     global SHUTDOWN, persistent_publisher, messaging_service
 
-    user_id = "user123"
+    user_id = "user1452"
     current_location = "123 Main St"
     destination = "456 Elm St"
 

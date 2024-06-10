@@ -17,15 +17,15 @@ TOPIC_PREFIX = "solace/taxi_samples"
 SHUTDOWN = False
 MAX_RETRIES = 30
 
-persistent_publisher = None  # 전역 변수 선언
-messaging_service = None  # 전역 변수 선언
+persistent_publisher = None
+messaging_service = None
 selected_driver = None
 driver_response_event = threading.Event()
-
+lock = threading.Lock()
 
 class RideRequestHandler(MessageHandler):
     def on_message(self, message: 'InboundMessage'):
-        global SHUTDOWN, persistent_publisher, messaging_service
+        global SHUTDOWN, persistent_publisher, messaging_service, selected_driver, driver_response_event
         if "quit" in message.get_destination_name():
             print("QUIT message received, shutting down.")
             SHUTDOWN = True
@@ -40,7 +40,10 @@ class RideRequestHandler(MessageHandler):
         current_location = request_data["currentLocation"]
         destination = request_data["destination"]
 
-        # Start broadcasting to drivers
+        # Reset state for new request
+        selected_driver = None
+        driver_response_event.clear()
+
         threading.Thread(target=broadcast_to_drivers, args=(user_id, current_location, destination)).start()
 
 
@@ -82,10 +85,10 @@ def broadcast_to_drivers(user_id, current_location, destination):
         print(f"Broadcast ride request to drivers, attempt {i + 1}")
         time.sleep(1)  # Broadcast interval
 
+    direct_publisher.terminate()
+
     if not driver_response_event.is_set():
         send_response_to_user(user_id, "택시 기사가 잡히지 않는다")
-
-    direct_publisher.terminate()
 
 
 def send_response_to_user(user_id, status, driver_info=None):
@@ -100,20 +103,21 @@ def send_response_to_user(user_id, status, driver_info=None):
         response_body.update(driver_info)
 
     message_body = json.dumps(response_body)
-
     message_builder = messaging_service.message_builder() \
         .with_application_message_id("ride_response") \
         .with_property("application", "taxi_service") \
         .with_property("language", "Python")
 
     outbound_message = message_builder.build(message_body)
-    persistent_publisher.publish(destination=Topic.of(topic_to_publish), message=outbound_message)
-    print(f"Sent response to user {user_id} with status {status}")
+    if persistent_publisher.is_running:
+        persistent_publisher.publish(destination=Topic.of(topic_to_publish), message=outbound_message)
+        print(f"Sent response to user {user_id} with status {status}")
+    else:
+        print(f"Unable to send response to user {user_id}, publisher is not running")
 
 
 def send_confirmation_to_driver(driver_id):
     global persistent_publisher, messaging_service
-
     topic_to_publish = f"{TOPIC_PREFIX}/DriverConfirmation/{driver_id}"
     message_body = json.dumps({
         "Timestamp": time.time(),
@@ -126,26 +130,55 @@ def send_confirmation_to_driver(driver_id):
         .with_property("language", "Python")
 
     outbound_message = message_builder.build(message_body)
-    persistent_publisher.publish(destination=Topic.of(topic_to_publish), message=outbound_message)
-    print(f"Sent confirmation to driver {driver_id}")
+    if persistent_publisher.is_running:
+        persistent_publisher.publish(destination=Topic.of(topic_to_publish), message=outbound_message)
+        print(f"Sent confirmation to driver {driver_id}")
+    else:
+        print(f"Unable to send confirmation to driver {driver_id}, publisher is not running")
+
+
+def send_failure_to_driver(driver_id):
+    global persistent_publisher, messaging_service
+
+    topic_to_publish = f"{TOPIC_PREFIX}/DriverResponse/{driver_id}"
+    message_body = json.dumps({
+        "Timestamp": time.time(),
+        "Message": "다른 기사가 먼저 accept하였습니다"
+    })
+
+    message_builder = messaging_service.message_builder() \
+        .with_application_message_id("driver_failure") \
+        .with_property("application", "taxi_service") \
+        .with_property("language", "Python")
+
+    outbound_message = message_builder.build(message_body)
+    if persistent_publisher.is_running:
+        persistent_publisher.publish(destination=Topic.of(topic_to_publish), message=outbound_message)
+        print(f"Sent failure notification to driver {driver_id}")
+    else:
+        print(f"Unable to send failure notification to driver {driver_id}, publisher is not running")
 
 
 class DriverResponseHandler(MessageHandler):
     def on_message(self, message: 'InboundMessage'):
-        global selected_driver, driver_response_event
-        if selected_driver is not None:
-            return
-
+        global selected_driver, driver_response_event, lock
         payload = message.get_payload_as_string() if message.get_payload_as_string() is not None else message.get_payload_as_bytes()
         if isinstance(payload, bytearray):
             payload = payload.decode()
 
         driver_info = json.loads(payload)
-        selected_driver = driver_info
-        driver_response_event.set()
+        with lock:
+            if selected_driver is None:
+                # 첫 번째로 응답한 드라이버를 선택
+                selected_driver = driver_info
+                driver_response_event.set()
 
-        send_response_to_user(driver_info["userId"], "택시가 잡혔습니다", driver_info)
-        send_confirmation_to_driver(driver_info["driverId"])
+                send_response_to_user(driver_info["userId"], "택시가 잡혔습니다", driver_info)
+                send_confirmation_to_driver(driver_info["driverId"])
+            else:
+                # 다른 드라이버에게 실패 메시지 전송
+                if selected_driver["driverId"] != driver_info["driverId"]:
+                    send_failure_to_driver(driver_info["driverId"])
 
 
 def main():
@@ -205,7 +238,7 @@ def main():
         print(f'Received a PubSubPlusClientException: {exception}')
     finally:
         print('Terminating Publisher and Receiver')
-        if persistent_publisher:
+        if persistent_publisher.is_running:
             persistent_publisher.terminate()
         direct_receiver.terminate()
         driver_response_receiver.terminate()
