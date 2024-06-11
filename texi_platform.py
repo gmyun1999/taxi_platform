@@ -2,6 +2,9 @@ import os
 import time
 import json
 import threading
+import sqlite3
+from datetime import datetime
+from solace.messaging.config.solace_properties.message_properties import APPLICATION_MESSAGE_ID
 from solace.messaging.messaging_service import MessagingService, RetryStrategy, ServiceInterruptionListener, \
     ReconnectionAttemptListener, ReconnectionListener, ServiceEvent
 from solace.messaging.resources.topic_subscription import TopicSubscription
@@ -10,10 +13,11 @@ from solace.messaging.receiver.message_receiver import MessageHandler
 from solace.messaging.receiver.inbound_message import InboundMessage
 from solace.messaging.errors.pubsubplus_client_error import PubSubPlusClientError
 from dotenv import load_dotenv
+from database import create_tables
 
 load_dotenv()
 
-TOPIC_PREFIX = "solace/taxi_samples"
+TOPIC_PREFIX = "solace/taxi_samples_yun"
 SHUTDOWN = False
 MAX_RETRIES = 30
 
@@ -22,6 +26,7 @@ messaging_service = None
 selected_driver = None
 driver_response_event = threading.Event()
 lock = threading.Lock()
+
 
 class RideRequestHandler(MessageHandler):
     def on_message(self, message: 'InboundMessage'):
@@ -87,20 +92,14 @@ def broadcast_to_drivers(user_id, current_location, destination):
 
     direct_publisher.terminate()
 
-    if not driver_response_event.is_set():
-        send_response_to_user(user_id, "택시 기사가 잡히지 않는다")
 
-
-def send_response_to_user(user_id, status, driver_info=None):
+def send_response_to_user(user_id, driverInfo):
     global persistent_publisher, messaging_service
 
     topic_to_publish = f"{TOPIC_PREFIX}/RideRequestResponse/{user_id}"
     response_body = {
-        "Timestamp": time.time(),
-        "Status": status
+        "driverInfo": driverInfo
     }
-    if driver_info:
-        response_body.update(driver_info)
 
     message_body = json.dumps(response_body)
     message_builder = messaging_service.message_builder() \
@@ -111,7 +110,7 @@ def send_response_to_user(user_id, status, driver_info=None):
     outbound_message = message_builder.build(message_body)
     if persistent_publisher.is_running:
         persistent_publisher.publish(destination=Topic.of(topic_to_publish), message=outbound_message)
-        print(f"Sent response to user {user_id} with status {status}")
+        print(f"Sent response to user {user_id} with status {driverInfo}")
     else:
         print(f"Unable to send response to user {user_id}, publisher is not running")
 
@@ -140,7 +139,7 @@ def send_confirmation_to_driver(driver_id):
 def send_failure_to_driver(driver_id):
     global persistent_publisher, messaging_service
 
-    topic_to_publish = f"{TOPIC_PREFIX}/DriverResponse/{driver_id}"
+    topic_to_publish = f"{TOPIC_PREFIX}/DriverConfirmation/{driver_id}"
     message_body = json.dumps({
         "Timestamp": time.time(),
         "Message": "다른 기사가 먼저 accept하였습니다"
@@ -173,7 +172,7 @@ class DriverResponseHandler(MessageHandler):
                 selected_driver = driver_info
                 driver_response_event.set()
 
-                send_response_to_user(driver_info["userId"], "택시가 잡혔습니다", driver_info)
+                send_response_to_user(user_id=driver_info["userId"], driverInfo=driver_info)
                 send_confirmation_to_driver(driver_info["driverId"])
             else:
                 # 다른 드라이버에게 실패 메시지 전송
@@ -181,8 +180,112 @@ class DriverResponseHandler(MessageHandler):
                     send_failure_to_driver(driver_info["driverId"])
 
 
+class PickupDropoffHandler(MessageHandler):
+    def on_message(self, message: 'InboundMessage'):
+        global persistent_publisher
+        payload = message.get_payload_as_string() if message.get_payload_as_string() is not None else message.get_payload_as_bytes()
+        if isinstance(payload, bytearray):
+            payload = payload.decode()
+
+        try:
+            data = json.loads(payload)
+            print(f"Received message on {message.get_destination_name()}: {data}")
+
+            if "Pickup" in message.get_destination_name():
+                print(f"Pickup message received: {data}")
+                save_pickup(data)
+                return
+
+            if "Dropoff" in message.get_destination_name():
+                print(f"Dropoff message received: {data}")
+                save_dropoff_and_calculate_cost(data)
+                return
+
+        except json.JSONDecodeError as e:
+            print(f"Failed to parse the message payload: {e}")
+        except KeyError as e:
+            print(f"Missing expected key in the message payload: {e}")
+
+
+def save_pickup(data):
+    connection = sqlite3.connect('taxi_service.db')
+    cursor = connection.cursor()
+
+    user_id = data["userId"]
+    rider_id = data["driverId"]
+    pickup_time = data["timestamp"]
+
+    cursor.execute('''
+        INSERT INTO Drive (riderId, userId, pickupTime)
+        VALUES (?, ?, ?)
+    ''', (rider_id, user_id, pickup_time))
+
+    connection.commit()
+    connection.close()
+
+
+def save_dropoff_and_calculate_cost(data):
+    connection = sqlite3.connect('taxi_service.db')
+    cursor = connection.cursor()
+
+    user_id = data["userId"]
+    rider_id = data["driverId"]
+    dropoff_time_str = data["timestamp"]
+
+    # Dropoff time을 datetime 객체로 변환
+    dropoff_time = datetime.fromisoformat(dropoff_time_str)
+
+    cursor.execute('''
+        SELECT pickupTime FROM Drive
+        WHERE riderId = ? AND userId = ?
+    ''', (rider_id, user_id))
+    pickup_time_str = cursor.fetchone()[0]
+
+    # Pickup time을 datetime 객체로 변환
+    pickup_time = datetime.fromisoformat(pickup_time_str)
+
+    # 시간 차이 계산
+    time_diff = (dropoff_time - pickup_time).total_seconds()
+    cost = time_diff * 10  # 초당 10원으로 계산
+
+    cursor.execute('''
+        UPDATE Drive
+        SET dropoffTime = ?, paymentState = 'Pending'
+        WHERE riderId = ? AND userId = ? AND paymentState IS NULL
+    ''', (dropoff_time_str, rider_id, user_id))
+
+    send_payment_request(user_id, rider_id, cost)
+
+    connection.commit()
+    connection.close()
+
+
+def send_payment_request(user_id, rider_id, cost):
+    global persistent_publisher, messaging_service
+
+    payment_topic = f"{TOPIC_PREFIX}/PaymentRequest"
+    payment_message = json.dumps({
+        "timestamp": datetime.now().isoformat(),
+        "userId": user_id,
+        "driverId": rider_id,
+        "cost": cost
+    })
+    message_builder = messaging_service.message_builder() \
+        .with_application_message_id("payment_request") \
+        .with_property("application", "taxi_service") \
+        .with_property("language", "Python")
+
+    additional_properties = {APPLICATION_MESSAGE_ID: 'payment_request_1'}
+    outbound_message = message_builder.build(payment_message,
+                                             additional_message_properties=additional_properties)
+    persistent_publisher.publish(destination=Topic.of(payment_topic), message=outbound_message)
+    print(f"Sent payment request: {payment_message}")
+
+
 def main():
     global SHUTDOWN, persistent_publisher, messaging_service
+
+    create_tables()
 
     topic_to_subscribe = f"{TOPIC_PREFIX}/RideRequest"
     topics_sub = [TopicSubscription.of(topic_to_subscribe)]
@@ -228,6 +331,14 @@ def main():
         driver_response_receiver.start()
         driver_response_receiver.receive_async(DriverResponseHandler())
 
+        # Subscribe to Pickup and Dropoff topics
+        pickup_dropoff_topics = [TopicSubscription.of(f"{TOPIC_PREFIX}/Pickup"),
+                                 TopicSubscription.of(f"{TOPIC_PREFIX}/Dropoff")]
+        pickup_dropoff_receiver = messaging_service.create_direct_message_receiver_builder().with_subscriptions(
+            pickup_dropoff_topics).build()
+        pickup_dropoff_receiver.start()
+        pickup_dropoff_receiver.receive_async(PickupDropoffHandler())
+
         if direct_receiver.is_running:
             print("Connected and Subscribed! Ready to receive ride requests\n")
         while not SHUTDOWN:
@@ -242,6 +353,7 @@ def main():
             persistent_publisher.terminate()
         direct_receiver.terminate()
         driver_response_receiver.terminate()
+        pickup_dropoff_receiver.terminate()
         print('Disconnecting Messaging Service')
         messaging_service.disconnect()
 
