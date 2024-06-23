@@ -7,10 +7,10 @@ from datetime import datetime
 from solace.messaging.config.solace_properties.message_properties import APPLICATION_MESSAGE_ID
 from solace.messaging.messaging_service import MessagingService, RetryStrategy, ServiceInterruptionListener, \
     ReconnectionAttemptListener, ReconnectionListener, ServiceEvent
-from solace.messaging.resources.topic_subscription import TopicSubscription
 from solace.messaging.resources.topic import Topic
-from solace.messaging.receiver.message_receiver import MessageHandler
-from solace.messaging.receiver.inbound_message import InboundMessage
+from solace.messaging.resources.topic_subscription import TopicSubscription
+from solace.messaging.resources.queue import Queue
+from solace.messaging.receiver.message_receiver import MessageHandler, InboundMessage
 from solace.messaging.errors.pubsubplus_client_error import PubSubPlusClientError
 from dotenv import load_dotenv
 from database import create_tables
@@ -27,9 +27,11 @@ selected_driver = None
 driver_response_event = threading.Event()
 lock = threading.Lock()
 
+# 전역 수신기 정의
+queue_receivers = {}
 
 class RideRequestHandler(MessageHandler):
-    def on_message(self, message: 'InboundMessage'):
+    def on_message(self, message: InboundMessage):
         global SHUTDOWN, persistent_publisher, messaging_service, selected_driver, driver_response_event
         if "quit" in message.get_destination_name():
             print("QUIT message received, shutting down.")
@@ -50,6 +52,10 @@ class RideRequestHandler(MessageHandler):
         driver_response_event.clear()
 
         threading.Thread(target=broadcast_to_drivers, args=(user_id, current_location, destination)).start()
+
+        # 메시지 확인
+        if 'queue_rideRequest' in queue_receivers:
+            queue_receivers['queue_rideRequest'].ack(message)
 
 
 class ServiceEventHandler(ReconnectionListener, ReconnectionAttemptListener, ServiceInterruptionListener):
@@ -110,7 +116,9 @@ def send_response_to_user(user_id, driverInfo):
     outbound_message = message_builder.build(message_body)
     if persistent_publisher.is_running:
         persistent_publisher.publish(destination=Topic.of(topic_to_publish), message=outbound_message)
+        print()
         print(f"Sent response to user {user_id} with status {driverInfo}")
+        print()
     else:
         print(f"Unable to send response to user {user_id}, publisher is not running")
 
@@ -132,6 +140,7 @@ def send_confirmation_to_driver(driver_id):
     if persistent_publisher.is_running:
         persistent_publisher.publish(destination=Topic.of(topic_to_publish), message=outbound_message)
         print(f"Sent confirmation to driver {driver_id}")
+        print()
     else:
         print(f"Unable to send confirmation to driver {driver_id}, publisher is not running")
 
@@ -154,12 +163,13 @@ def send_failure_to_driver(driver_id):
     if persistent_publisher.is_running:
         persistent_publisher.publish(destination=Topic.of(topic_to_publish), message=outbound_message)
         print(f"Sent failure notification to driver {driver_id}")
+        print()
     else:
         print(f"Unable to send failure notification to driver {driver_id}, publisher is not running")
 
 
 class DriverResponseHandler(MessageHandler):
-    def on_message(self, message: 'InboundMessage'):
+    def on_message(self, message: InboundMessage):
         global selected_driver, driver_response_event, lock
         payload = message.get_payload_as_string() if message.get_payload_as_string() is not None else message.get_payload_as_bytes()
         if isinstance(payload, bytearray):
@@ -179,9 +189,13 @@ class DriverResponseHandler(MessageHandler):
                 if selected_driver["driverId"] != driver_info["driverId"]:
                     send_failure_to_driver(driver_info["driverId"])
 
+        # 메시지 확인
+        if 'queue_DriverResponse' in queue_receivers:
+            queue_receivers['queue_DriverResponse'].ack(message)
+
 
 class PickupDropoffHandler(MessageHandler):
-    def on_message(self, message: 'InboundMessage'):
+    def on_message(self, message: InboundMessage):
         global persistent_publisher
         payload = message.get_payload_as_string() if message.get_payload_as_string() is not None else message.get_payload_as_bytes()
         if isinstance(payload, bytearray):
@@ -189,22 +203,29 @@ class PickupDropoffHandler(MessageHandler):
 
         try:
             data = json.loads(payload)
+            print()
             print(f"Received message on {message.get_destination_name()}: {data}")
 
             if "Pickup" in message.get_destination_name():
                 print(f"Pickup message received: {data}")
+                print()
                 save_pickup(data)
-                return
 
-            if "Dropoff" in message.get_destination_name():
+            elif "Dropoff" in message.get_destination_name():
                 print(f"Dropoff message received: {data}")
+                print()
                 save_dropoff_and_calculate_cost(data)
-                return
 
         except json.JSONDecodeError as e:
             print(f"Failed to parse the message payload: {e}")
         except KeyError as e:
             print(f"Missing expected key in the message payload: {e}")
+
+        # 메시지 확인
+        if 'queue_Pickup' in queue_receivers:
+            queue_receivers['queue_Pickup'].ack(message)
+        if 'queue_Dropoff' in queue_receivers:
+            queue_receivers['queue_Dropoff'].ack(message)
 
 
 def save_pickup(data):
@@ -283,12 +304,15 @@ def send_payment_request(user_id, rider_id, cost):
 
 
 def main():
-    global SHUTDOWN, persistent_publisher, messaging_service
+    global SHUTDOWN, persistent_publisher, messaging_service, queue_receivers
 
     create_tables()
 
-    topic_to_subscribe = f"{TOPIC_PREFIX}/RideRequest"
-    topics_sub = [TopicSubscription.of(topic_to_subscribe)]
+    # Solace 메시지 구독 설정
+    queue_rideRequest = "Q.GYUMIN_RideRequest"
+    queue_DriverResponse = "Q.GYUMIN_DriverResponse"
+    queue_Pickup = "Q.GYUMIN_Pickup"
+    queue_Dropoff = "Q.GYUMIN_Dropoff"
 
     solace_host = os.getenv('SOLACE_HOST')
     solace_vpn = os.getenv('SOLACE_VPN')
@@ -319,27 +343,35 @@ def main():
     persistent_publisher.start()
 
     try:
+        print(f"Subscribed to queue: {queue_rideRequest}")
+        queue_receiver = messaging_service.create_persistent_message_receiver_builder().build(
+            Queue.durable_exclusive_queue(queue_rideRequest))
+        queue_receiver.start()
+        queue_receiver.receive_async(RideRequestHandler())
+        queue_receivers['queue_rideRequest'] = queue_receiver
 
-        direct_receiver = messaging_service.create_direct_message_receiver_builder().with_subscriptions(
-            topics_sub).build()
-        direct_receiver.start()
-        direct_receiver.receive_async(RideRequestHandler())
-
-        driver_response_topics = [TopicSubscription.of(f"{TOPIC_PREFIX}/DriverResponse")]
-        driver_response_receiver = messaging_service.create_direct_message_receiver_builder().with_subscriptions(
-            driver_response_topics).build()
+        print(f"Subscribed to queue: {queue_DriverResponse}")
+        driver_response_receiver = messaging_service.create_persistent_message_receiver_builder().build(
+            Queue.durable_exclusive_queue(queue_DriverResponse))
         driver_response_receiver.start()
         driver_response_receiver.receive_async(DriverResponseHandler())
+        queue_receivers['queue_DriverResponse'] = driver_response_receiver
 
-        # Subscribe to Pickup and Dropoff topics
-        pickup_dropoff_topics = [TopicSubscription.of(f"{TOPIC_PREFIX}/Pickup"),
-                                 TopicSubscription.of(f"{TOPIC_PREFIX}/Dropoff")]
-        pickup_dropoff_receiver = messaging_service.create_direct_message_receiver_builder().with_subscriptions(
-            pickup_dropoff_topics).build()
-        pickup_dropoff_receiver.start()
-        pickup_dropoff_receiver.receive_async(PickupDropoffHandler())
+        print(f"Subscribed to queue: {queue_Pickup}")
+        pickup_receiver = messaging_service.create_persistent_message_receiver_builder().build(
+            Queue.durable_exclusive_queue(queue_Pickup))
+        pickup_receiver.start()
+        pickup_receiver.receive_async(PickupDropoffHandler())
+        queue_receivers['queue_Pickup'] = pickup_receiver
 
-        if direct_receiver.is_running:
+        print(f"Subscribed to queue: {queue_Dropoff}")
+        dropoff_receiver = messaging_service.create_persistent_message_receiver_builder().build(
+            Queue.durable_exclusive_queue(queue_Dropoff))
+        dropoff_receiver.start()
+        dropoff_receiver.receive_async(PickupDropoffHandler())
+        queue_receivers['queue_Dropoff'] = dropoff_receiver
+
+        if queue_receiver.is_running:
             print("Connected and Subscribed! Ready to receive ride requests\n")
         while not SHUTDOWN:
             time.sleep(1)
@@ -351,9 +383,9 @@ def main():
         print('Terminating Publisher and Receiver')
         if persistent_publisher.is_running:
             persistent_publisher.terminate()
-        direct_receiver.terminate()
-        driver_response_receiver.terminate()
-        pickup_dropoff_receiver.terminate()
+        for receiver in queue_receivers.values():
+            if receiver.is_running:
+                receiver.terminate()
         print('Disconnecting Messaging Service')
         messaging_service.disconnect()
 

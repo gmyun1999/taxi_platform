@@ -126,7 +126,6 @@ def main():
     topics_sub = [TopicSubscription.of(topic_to_subscribe)]
 
     try:
-        print(f"Subscribed to: {topics_sub}")
         direct_receiver = messaging_service.create_direct_message_receiver_builder().with_subscriptions(
             topics_sub).build()
         direct_receiver.start()

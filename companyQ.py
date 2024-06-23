@@ -89,6 +89,7 @@ def send_payment_request_to_user(user_id, cost):
     print(f"Sent payment request to user for user ID: {user_id}")
     direct_publisher.terminate()
 
+
 class PaymentRequestHandler(MessageHandler):
     def on_message(self, message: 'InboundMessage'):
         global messaging_service
@@ -140,7 +141,6 @@ def main():
     user_response_topic = f"{TOPIC_PREFIX}/CompanyQPaymentRequestResponse"
 
     try:
-        print(f"Subscribed to: {payment_request_topic} and {user_response_topic}")
         payment_request_receiver = messaging_service.create_direct_message_receiver_builder().with_subscriptions(
             [TopicSubscription.of(payment_request_topic)]).build()
         payment_request_receiver.start()

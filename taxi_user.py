@@ -92,7 +92,7 @@ def send_ride_request(user_id, current_location, destination):  # 문제없음
 def send_payment_response(user_id, response):  # 문제없음
     global persistent_publisher, messaging_service, SHUTDOWN
 
-    topic_to_publish = f"{TOPIC_PREFIX}/CompanyQPaymentRequestResponse/{user_id}"
+    topic_to_publish = f"{TOPIC_PREFIX}/CompanyQPaymentRequestResponse"
     message_body = json.dumps({
         "userId": user_id,
         "response": response,
@@ -177,7 +177,7 @@ def main():
     payment_request_topic = f"{TOPIC_PREFIX}/CompanyQPaymentRequest/{user_id}"
 
     try:
-        print(f"Subscribed to: {ride_response_topic} and {payment_request_topic}")
+
 
         # Receiver for ride response topic
         ride_response_receiver = messaging_service.create_direct_message_receiver_builder().with_subscriptions(
